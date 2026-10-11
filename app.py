@@ -8,7 +8,9 @@ import subprocess
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -22,6 +24,54 @@ WIDTH, HEIGHT = 720, 1280
 MAX_PROMPT_LENGTH = 600
 MAX_SCENES = 8
 STYLE_LABELS = {"pov": "POV", "story": "AI Story", "cartoon": "AI Cartoon", "satisfying": "Satisfying", "cinematic": "Cinematic"}
+
+
+def load_local_env() -> None:
+    env_file = ROOT / '.env'
+    if not env_file.is_file():
+        return
+    try:
+        for raw_line in env_file.read_text(encoding='utf-8-sig').splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key, value = key.strip(), value.strip().strip(chr(34)).strip(chr(39))
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError:
+        pass
+
+load_local_env()
+
+def search_pixabay_videos(query: str, per_page: int = 8) -> dict:
+    query = clean_text(query, 100)
+    if not query:
+        raise ValueError('Enter a topic to search for stock footage.')
+    api_key = os.environ.get('PIXABAY_API_KEY', '').strip()
+    if not api_key or api_key == 'YAHAN_APNI_API_KEY_DAALO':
+        raise RuntimeError('Pixabay API key not found. Check that .env is in the same folder as app.py and contains PIXABAY_API_KEY=your_key.')
+    params = urlencode({'key': api_key, 'q': query, 'per_page': max(3, min(int(per_page), 12)), 'safesearch': 'true'})
+    request = Request('https://pixabay.com/api/videos/?' + params, headers={'User-Agent': 'ShortsStudio/0.2'})
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RuntimeError('Pixabay rejected the API key. Check the key in your local .env file.') from exc
+        if exc.code == 429:
+            raise RuntimeError('Pixabay rate limit reached. Wait a minute and try again.') from exc
+        raise RuntimeError(f'Pixabay request failed (HTTP {exc.code}).') from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError('Could not reach Pixabay. Check your internet connection and try again.') from exc
+    results = []
+    for hit in payload.get('hits', []):
+        videos = hit.get('videos') or {}
+        chosen = videos.get('medium') or videos.get('small') or videos.get('large') or next(iter(videos.values()), {})
+        if not chosen.get('url'):
+            continue
+        results.append({'id': hit.get('id'), 'tags': clean_text(hit.get('tags', 'Stock video'), 180), 'duration': hit.get('duration', 0), 'views': hit.get('views', 0), 'preview': chosen.get('url'), 'width': chosen.get('width', 0), 'height': chosen.get('height', 0), 'page_url': 'https://pixabay.com/videos/id-' + str(hit.get('id', '')) + '/'})
+    return {'query': query, 'total': payload.get('total', len(results)), 'clips': results}
 
 def clean_text(value: object, limit: int = 180) -> str:
     if not isinstance(value, str):
@@ -184,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "Not found"})
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/api/storyboard", "/api/render"):
+        if path not in ("/api/storyboard", "/api/render", "/api/clips"):
             return self._json(404, {"error": "Not found"})
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -193,6 +243,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(data, dict):
                 return self._json(400, {"error": "Expected a JSON object."})
+            if path == "/api/clips":
+                return self._json(200, search_pixabay_videos(data.get("query", ""), data.get("per_page", 8)))
             if path == "/api/storyboard":
                 duration = data.get("duration", 30)
                 if isinstance(duration, str) and duration.isdigit():
